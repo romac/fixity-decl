@@ -25,19 +25,27 @@ import qualified Text.Megaparsec.Lexer as L
 type Name = String
 
 data Expr
-  = BinOp Name Expr Expr
+  = Neg Expr
   | Lit Integer
-  | Neg Expr
+  | UnaryOp Name Expr
+  | BinaryOp Name Expr Expr
   deriving (Eq, Show)
 
 pprint :: Expr -> String
-pprint (BinOp n l r) = concat ["(", pprint l, " ", n, " ", pprint r, ")"]
-pprint (Lit i)       = show i
-pprint (Neg e)       = "(-" ++ pprint e ++ ")"
+pprint (Neg e)          = concat ["(-", pprint e, ")"]
+pprint (Lit i)          = show i
+pprint (UnaryOp n e)    = concat ["(", n, " ", pprint e, ")"]
+pprint (BinaryOp n l r) = concat ["(", pprint l, " ", n, " ", pprint r, ")"]
 
 data Assoc
   = AssocL
   | AssocR
+  deriving (Eq, Show)
+
+data Fixity
+  = FixPre
+  | FixPost
+  | FixInf Assoc
   deriving (Eq, Show)
 
 newtype Prec
@@ -45,7 +53,7 @@ newtype Prec
   deriving (Eq, Ord, Num, Show)
 
 data FixityDecl
-  = FixityDecl Name Assoc Prec
+  = FixityDecl Name Fixity Prec
   deriving (Eq, Show)
 
 sc :: Parser ()
@@ -88,19 +96,29 @@ fixityDeclsParser :: Parser [FixityDecl]
 fixityDeclsParser = sepEndBy1 fixityDeclParser semi
 
 fixityDeclParser :: Parser FixityDecl
-fixityDeclParser = try leftInfix <|> rightInfix
+fixityDeclParser = prefix <|> postfix <|> infixL <|> infixR
   where
-    leftInfix = do
+    prefix = do
+      reserved "prefix"
+      name <- parens (some operator)
+      return $ FixityDecl name FixPre (Prec 999999)
+
+    postfix = do
+      reserved "postfix"
+      name <- parens (some operator)
+      return $ FixityDecl name FixPost (Prec 888888)
+
+    infixL = do
       reserved "infixl"
       name <- parens (some operator)
       prec <- integer
-      return $ FixityDecl name AssocL (Prec prec)
+      return $ FixityDecl name (FixInf AssocL) (Prec prec)
 
-    rightInfix = do
+    infixR = do
       reserved "infixr"
       name <- parens (some operator)
       prec <- integer
-      return $ FixityDecl name AssocR (Prec prec)
+      return $ FixityDecl name (FixInf AssocR) (Prec prec)
 
 groupSortFixityDeclsByPrec :: [FixityDecl] -> [[FixityDecl]]
 groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList grouped)
@@ -109,13 +127,14 @@ groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList grouped)
     precDecls = [(prec, [decl]) | decl@(FixityDecl _ _ prec) <- decls]
 
 fixityDeclToOperator :: FixityDecl -> Operator Parser Expr
-fixityDeclToOperator (FixityDecl name assoc _) = makeOp (assocToInfix assoc) name (BinOp name)
-  where
-    assocToInfix AssocL = InfixL
-    assocToInfix AssocR = InfixR
+fixityDeclToOperator (FixityDecl name (FixInf assoc) _) = binary  assoc name (BinaryOp name)
+fixityDeclToOperator (FixityDecl name FixPre _)         = prefix        name (UnaryOp name)
+fixityDeclToOperator (FixityDecl name FixPost _)        = postfix       name (UnaryOp name)
 
-makeOp assoc name f = assoc (f <$ symbol name)
-prefix = makeOp Prefix
+binary AssocL name f = InfixL  (f <$ symbol name)
+binary AssocR name f = InfixR  (f <$ symbol name)
+prefix        name f = Prefix  (f <$ symbol name)
+postfix       name f = Postfix (f <$ symbol name)
 
 defaultPrefixOps = [ [ prefix "-" Neg ] ]
 
