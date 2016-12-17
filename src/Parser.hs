@@ -1,25 +1,17 @@
 
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Parser where
 
+import           Control.Applicative (empty)
 import           Control.Monad (void)
 import           System.IO (readFile)
 
-import           Data.Map (Map)
 import qualified Data.Map as Map
-
-import           Data.Set (Set)
-import qualified Data.Set as Set
-
-import           Data.Text (Text)
-import qualified Data.Text as T
 
 import           Text.Megaparsec
 import           Text.Megaparsec.Expr
 import           Text.Megaparsec.String
-import           Text.Megaparsec.Char
 import qualified Text.Megaparsec.Lexer as L
 
 type Name = String
@@ -38,7 +30,8 @@ pprint (UnaryOp n e)    = concat ["(", n, " ", pprint e, ")"]
 pprint (BinaryOp n l r) = concat ["(", pprint l, " ", n, " ", pprint r, ")"]
 
 data Assoc
-  = AssocL
+  = AssocN
+  | AssocL
   | AssocR
   deriving (Eq, Show)
 
@@ -56,10 +49,11 @@ data FixityDecl
   = FixityDecl Name Fixity Prec
   deriving (Eq, Show)
 
+scn :: Parser ()
+scn = L.space (void spaceChar) empty empty
+
 sc :: Parser ()
-sc = L.space (void spaceChar) lineCmnt blockCmnt
-  where lineCmnt  = L.skipLineComment "//"
-        blockCmnt = L.skipBlockComment "/*" "*/"
+sc = L.space (void $ oneOf " \t") empty empty
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme sc
@@ -67,13 +61,11 @@ lexeme = L.lexeme sc
 symbol :: String -> Parser String
 symbol = L.symbol sc
 
-operators :: Set Char
-operators = Set.fromList ['-', ':']
+operatorChar :: Parser Char
+operatorChar = symbolChar <|> punctuationChar <|> char '-'
 
-isOperator c = Set.member c operators
-
-operator :: Parser Char
-operator = (try symbolChar <|> satisfy isOperator) <?> "operator"
+operator :: Parser String
+operator = some operatorChar <?> "operator"
 
 integer :: Parser Integer
 integer = lexeme L.integer
@@ -84,77 +76,64 @@ parens = between (symbol "(") (symbol ")")
 reserved :: String -> Parser ()
 reserved w = string w *> notFollowedBy alphaNumChar *> sc
 
-semi :: Parser ()
-semi = void $ symbol ";"
-
 termParser :: Parser Expr -> Parser Expr
-termParser exprParser
-   =  try (Lit <$> integer)
-  <|> try (parens exprParser)
+termParser exprParser = Lit <$> integer <|> parens exprParser
 
 fixityDeclsParser :: Parser [FixityDecl]
-fixityDeclsParser = sepEndBy1 fixityDeclParser semi
+fixityDeclsParser = sepEndBy fixityDeclParser scn
 
 fixityDeclParser :: Parser FixityDecl
-fixityDeclParser = prefix <|> postfix <|> infixL <|> infixR
-  where
-    prefix = do
-      reserved "prefix"
-      name <- parens (some operator)
-      return $ FixityDecl name FixPre (Prec 999999)
+fixityDeclParser = label "fixity declaration" $ do
+  fix  <- fixity
+  prec <- precedence
+  op   <- operator
+  return $ FixityDecl op fix prec
+    where
+      precedence = Prec <$> option 9 integer
 
-    postfix = do
-      reserved "postfix"
-      name <- parens (some operator)
-      return $ FixityDecl name FixPost (Prec 888888)
-
-    infixL = do
-      reserved "infixl"
-      name <- parens (some operator)
-      prec <- integer
-      return $ FixityDecl name (FixInf AssocL) (Prec prec)
-
-    infixR = do
-      reserved "infixr"
-      name <- parens (some operator)
-      prec <- integer
-      return $ FixityDecl name (FixInf AssocR) (Prec prec)
+      fixity =  reserved "prefix"  *> pure FixPre
+            <|> reserved "postfix" *> pure FixPost
+            <|> reserved "infixl"  *> pure (FixInf AssocL)
+            <|> reserved "infixr"  *> pure (FixInf AssocR)
+            <|> reserved "infix"   *> pure (FixInf AssocN)
 
 groupSortFixityDeclsByPrec :: [FixityDecl] -> [[FixityDecl]]
-groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList grouped)
+groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList groupedByPrec)
   where
-    grouped   = Map.fromListWith (++) precDecls
-    precDecls = [(prec, [decl]) | decl@(FixityDecl _ _ prec) <- decls]
+    groupedByPrec = Map.fromListWith (++) precDecls
+    precDecls     = [(prec, [decl]) | decl@(FixityDecl _ _ prec) <- decls]
 
 fixityDeclToOperator :: FixityDecl -> Operator Parser Expr
-fixityDeclToOperator (FixityDecl name (FixInf assoc) _) = binary  assoc name (BinaryOp name)
-fixityDeclToOperator (FixityDecl name FixPre _)         = prefix        name (UnaryOp name)
-fixityDeclToOperator (FixityDecl name FixPost _)        = postfix       name (UnaryOp name)
+fixityDeclToOperator (FixityDecl name fixity _) = makeOp fixity
+  where
+    makeOp FixPre         = prefix       name (UnaryOp name)
+    makeOp FixPost        = postfix      name (UnaryOp name)
+    makeOp (FixInf assoc) = binary assoc name (BinaryOp name)
 
+binary :: Assoc -> String -> (a -> a -> a) -> Operator Parser a
+binary AssocN name f = InfixN  (f <$ symbol name)
 binary AssocL name f = InfixL  (f <$ symbol name)
 binary AssocR name f = InfixR  (f <$ symbol name)
-prefix        name f = Prefix  (f <$ symbol name)
-postfix       name f = Postfix (f <$ symbol name)
 
-defaultPrefixOps = [ [ prefix "-" Neg ] ]
+prefix, postfix :: String -> (a -> a) -> Operator Parser a
+prefix  name f = Prefix  (f <$ symbol name)
+postfix name f = Postfix (f <$ symbol name)
 
 buildOperatorTable :: [FixityDecl] -> [[Operator Parser Expr]]
-buildOperatorTable decls = defaultPrefixOps ++ infixOps
-  where
-    infixOps    = fmap fixityDeclToOperator <$> sortedDecls
-    sortedDecls = groupSortFixityDeclsByPrec decls
+buildOperatorTable decls = fmap fixityDeclToOperator <$> sortedDecls
+  where sortedDecls = groupSortFixityDeclsByPrec decls
 
 buildExprParser :: Parser Expr -> [FixityDecl] -> Parser Expr
 buildExprParser p = makeExprParser p . buildOperatorTable
 
+parseTopLevel :: Parser a -> Parser a
+parseTopLevel p = between scn (scn >> eof) p
+
 topLevelParser :: Parser Expr
-topLevelParser = do
-  sc
+topLevelParser = parseTopLevel $ do
   fixityDecls <- fixityDeclsParser
   let exprParser = exprParser' fixityDecls
-  expr <- exprParser
-  eof
-  return expr
+  exprParser
 
 exprParser' :: [FixityDecl] -> Parser Expr
 exprParser' decls =
