@@ -77,7 +77,7 @@ reserved :: String -> Parser ()
 reserved w = string w *> notFollowedBy alphaNumChar *> sc
 
 termParser :: Parser Expr -> Parser Expr
-termParser exprParser = Lit <$> integer <|> parens exprParser
+termParser expr = Lit <$> integer <|> parens expr
 
 fixityDeclsParser :: Parser [FixityDecl]
 fixityDeclsParser = sepEndBy fixityDeclParser scn
@@ -97,12 +97,6 @@ fixityDeclParser = label "fixity declaration" $ do
             <|> reserved "infixr"  *> pure (FixInf AssocR)
             <|> reserved "infix"   *> pure (FixInf AssocN)
 
-groupSortFixityDeclsByPrec :: [FixityDecl] -> [[FixityDecl]]
-groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList groupedByPrec)
-  where
-    groupedByPrec = Map.fromListWith (++) precDecls
-    precDecls     = [(prec, [decl]) | decl@(FixityDecl _ _ prec) <- decls]
-
 fixityDeclToOperator :: FixityDecl -> Operator Parser Expr
 fixityDeclToOperator (FixityDecl name fixity _) = makeOp fixity
   where
@@ -119,26 +113,34 @@ prefix, postfix :: String -> (a -> a) -> Operator Parser a
 prefix  name f = Prefix  (f <$ symbol name)
 postfix name f = Postfix (f <$ symbol name)
 
+groupSortFixityDeclsByPrec :: [FixityDecl] -> [[FixityDecl]]
+groupSortFixityDeclsByPrec decls = snd <$> reverse (Map.toList groupedByPrec)
+  where
+    groupedByPrec = Map.fromListWith (++) precDecls
+    precDecls     = [(prec, [decl]) | decl@(FixityDecl _ _ prec) <- decls]
+
 buildOperatorTable :: [FixityDecl] -> [[Operator Parser Expr]]
 buildOperatorTable decls = fmap fixityDeclToOperator <$> sortedDecls
-  where sortedDecls = groupSortFixityDeclsByPrec decls
+  where
+    sortedDecls = preDecls ++ postDecls ++ infDecls
+    preDecls    = groupSortFixityDeclsByPrec [decl | decl@(FixityDecl _ FixPre  _)    <- decls]
+    postDecls   = groupSortFixityDeclsByPrec [decl | decl@(FixityDecl _ FixPost _)    <- decls]
+    infDecls    = groupSortFixityDeclsByPrec [decl | decl@(FixityDecl _ (FixInf _) _) <- decls]
 
 buildExprParser :: Parser Expr -> [FixityDecl] -> Parser Expr
 buildExprParser p = makeExprParser p . buildOperatorTable
 
 parseTopLevel :: Parser a -> Parser a
-parseTopLevel p = between scn (scn >> eof) p
+parseTopLevel = between scn (scn >> eof)
 
 topLevelParser :: Parser Expr
 topLevelParser = parseTopLevel $ do
   fixityDecls <- fixityDeclsParser
-  let exprParser = exprParser' fixityDecls
-  exprParser
+  exprParser fixityDecls
 
-exprParser' :: [FixityDecl] -> Parser Expr
-exprParser' decls =
-  let exprParser = buildExprParser (termParser exprParser) decls
-   in exprParser
+exprParser :: [FixityDecl] -> Parser Expr
+exprParser decls = exprParser'
+  where exprParser' = buildExprParser (termParser exprParser') decls
 
 parseFile :: String -> IO Expr
 parseFile file = do
