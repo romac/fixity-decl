@@ -5,14 +5,28 @@ module Parser where
 
 import           Control.Applicative (empty)
 import           Control.Monad (void)
+import           Control.Monad.State.Strict hiding (fix, state)
 import           System.IO (readFile)
 
 import qualified Data.Map as Map
 
-import           Text.Megaparsec
+import           Text.Megaparsec hiding (State)
 import           Text.Megaparsec.Expr
-import           Text.Megaparsec.String
 import qualified Text.Megaparsec.Lexer as L
+
+data ParserState
+  = ParserState
+    { fixities :: [FixityDecl]
+    , curExprParser :: Parser Expr
+    }
+
+initialState :: ParserState
+initialState = ParserState
+  { fixities      = []
+  , curExprParser = newExprParser []
+  }
+
+type Parser = ParsecT Dec String (State ParserState)
 
 type Name = String
 
@@ -86,8 +100,18 @@ termParser :: Parser Expr -> Parser Expr
 termParser expr = withPos $ \pos ->
   Lit pos <$> integer <|> parens expr
 
-fixityDeclsParser :: Parser [FixityDecl]
-fixityDeclsParser = sepEndBy fixityDeclParser scn
+addFixityDecl :: FixityDecl -> Parser ()
+addFixityDecl decl = do
+  state <- get
+  let fixDecls = decl : fixities state
+  let newState = state {
+      fixities      = fixDecls,
+      curExprParser = newExprParser fixDecls
+    }
+  put newState
+
+fixityDecl :: Parser ()
+fixityDecl = fixityDeclParser >>= addFixityDecl
 
 fixityDeclParser :: Parser FixityDecl
 fixityDeclParser = label "fixity declaration" $ do
@@ -145,17 +169,24 @@ parseTopLevel = between scn (scn >> eof)
 
 topLevelParser :: Parser Expr
 topLevelParser = parseTopLevel $ do
-  fixityDecls <- fixityDeclsParser
-  exprParser fixityDecls
+  void $ sepEndBy fixityDecl scn
+  exprParser
 
-exprParser :: [FixityDecl] -> Parser Expr
-exprParser decls = exprParser'
+exprParser :: Parser Expr
+exprParser = do
+  parser <- gets curExprParser
+  parser
+
+newExprParser :: [FixityDecl] -> Parser Expr
+newExprParser decls = exprParser'
   where exprParser' = buildExprParser (termParser exprParser') decls
 
 parseFile :: String -> IO Expr
 parseFile file = do
   contents <- readFile file
-  case parse topLevelParser file contents of
+  let result' = runParserT topLevelParser file contents
+  let result  = evalState result' initialState
+  case result of
     Left err  -> error (parseErrorPretty err)
     Right res -> return res
 
